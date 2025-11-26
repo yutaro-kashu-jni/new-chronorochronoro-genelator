@@ -1,0 +1,43 @@
+# .gcloudignore
+# gcloud はまずこれで「Cloud Build へ送るファイル」を絞ります
+# git 管理情報
+.git/
+.gitignore
+.gcloudignore
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+*.env
+*.coverage
+.mypy_cache/
+
+# データ・成果物・一時
+data/
+tmp/
+outputs/
+artifacts/
+*.csv
+*.tsv
+*.parquet
+*.zip
+*.pptx
+*.docx
+*.pdf
+*.png
+*.jpg
+*.log
+
+# ノートブック
+*.ipynb
+.ipynb_checkpoints/
+
+# フロント系
+node_modules/
+
+# OS ごみ
+.DS_Store
+Thumbs.db
+

@@ -1,0 +1,25 @@
+# GCP
+google-cloud-storage
+google-cloud-translate
+google-cloud-aiplatform
+
+# scraping & parsing
+requests
+playwright==1.53.0
+beautifulsoup4
+lxml
+readability-lxml
+trafilatura
+newspaper3k
+tldextract
+html5lib
+
+# data & utils
+pandas
+numpy
+python-dateutil
+dateparser
+ujson
+
+# optional: progress/logging
+tqdm
