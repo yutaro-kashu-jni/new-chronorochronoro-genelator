@@ -1,21 +1,33 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-articles.json と master_media_data-utf8.csv を突合し、
-指定の 7 項目を JSON 形式で出力するワンパススクリプト。
-"""
 
+#!/usr/bin/env python3
+# =============================================================================
+# このファイル combine_.py の役割
+# -----------------------------------------------------------------------------
+# ・articles.json（記事データ）と master_media_data-utf8.csv（媒体データ）を突合し、
+#   指定の7項目を日本語化・整形してJSON/CSVで出力するスクリプトです。
+# ・GCPの翻訳APIやVertex AI LLMを活用し、記事本文やタイトルの自動翻訳も行います。
+# ・データの正規化、欠損補完、ドメイン名マッチング、出力整形なども一括で実施します。
+# ・実行すると output/articles_enriched.json, articles_enriched.csv を生成します。
+# =============================================================================
+# -*- coding: utf-8 -*-
+
+
+
+# --- 必要な標準・外部ライブラリのインポート ---
 from pathlib import Path
 import json
 import pandas as pd
 from urllib.parse import urlparse
 
+
+# --- Google Cloud翻訳API/Vertex AIの利用可否を判定 ---
 try:
     from google.cloud import translate  # v3
     _GCP_TRANSLATE_AVAILABLE = True
 except Exception as e:
     _GCP_TRANSLATE_AVAILABLE = False
     _GCP_TRANSLATE_IMPORT_ERR = e
+
 
 try:
     from google.cloud import aiplatform
@@ -25,9 +37,13 @@ except Exception as e:
     _GCP_AIPLATFORM_AVAILABLE = False
     _GCP_AIPLATFORM_IMPORT_ERR = e
 
+
+# --- Google API例外クラスのインポート ---
 from google.api_core import exceptions as gax_exceptions
 
 
+
+# --- ローカル開発用: .envファイルから環境変数を読み込む処理 ---
 import os
 # ── Load .env for local development (optional) ───────────────────────────────
 # 優先度: 既存の環境変数 > .env/.env.local
@@ -38,7 +54,7 @@ try:
             load_dotenv(dotenv_path=_p, override=False)
             break
 except Exception:
-    # フォールバック: 超簡易パーサ（KEY=VALUE 形式のみ／クォートは剥がす）
+    # .envが無い場合の簡易パーサ
     for _p in (Path(".env"), Path(".env.local")):
         try:
             if _p.exists():
@@ -52,28 +68,33 @@ except Exception:
         except Exception:
             pass
 
-# ------------------------------------------------------------------------------
-# 設定
-# ------------------------------------------------------------------------------
+
+# --- 翻訳APIやバッチ処理の各種設定値 ---
 
 TRANSLATE_BATCH_SIZE = 16
 
-# Per-request size limits (codepoints) for Translation APIs
+
+# --- 翻訳APIのリクエストサイズや分割単位の設定 ---
 TRANSLATE_REQ_MAX_CODEPOINTS = int(os.getenv("TRANSLATE_REQ_MAX_CODEPOINTS", "30000"))  # API hard limit is 30720
 TRANSLATE_REQ_HEADROOM = int(os.getenv("TRANSLATE_REQ_HEADROOM", "1024"))               # safety margin
-# Max length of a single segment when we split long texts
+# 長文を分割する際の1セグメントあたりの最大長
 TRANSLATE_SEGMENT_MAX_CODEPOINTS = int(os.getenv("TRANSLATE_SEGMENT_MAX_CODEPOINTS", "8000"))
 
-# ------------------------------------------------------------------------------
-# DEBUG スイッチ
-# ------------------------------------------------------------------------------
+
+# --- デバッグ出力用スイッチと関数 ---
+ # デバッグ用: DEBUGが有効な場合のみ標準出力に内容を表示する関数
+def _dbg(*args):
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
+# デバッグ用: DEBUGが有効な場合のみ標準出力に内容を表示する関数
 def _dbg(*args):
     if DEBUG:
         print("[DEBUG]", *args)
 
-# --- Helpers for safe batching under API codepoint limits --------------------
+
+# --- 文字列をAPI制限内で安全に分割・バッチ化するヘルパー関数群 ---
+ # 長いテキストを指定した最大長で安全に分割する関数
+ # 長いテキストを指定した最大長で安全に分割する関数
 def _split_long_text(s: str, max_len: int = TRANSLATE_SEGMENT_MAX_CODEPOINTS):
     """
     Split a long string into segments not exceeding max_len codepoints.
@@ -85,17 +106,17 @@ def _split_long_text(s: str, max_len: int = TRANSLATE_SEGMENT_MAX_CODEPOINTS):
 
     segs = []
     cur = ""
-    # First, try to build chunks by paragraphs
+    # まず段落単位でチャンク化を試みる
     for para in s.split("\n\n"):
         candidate = (cur + ("\n\n" if cur else "") + para) if cur else para
         if len(candidate) <= max_len:
             cur = candidate
         else:
-            # If a single paragraph is too big, further split by single newlines or punctuation
+            # 1段落が大きすぎる場合は改行や句読点でさらに分割
             buf = (cur + ("\n\n" if cur else "")) if cur else ""
             part = para
             while part:
-                # Try to cut near max_len on natural boundaries
+                # max_len付近で自然な区切りを探して分割
                 limit = max_len - len(buf)
                 if limit <= 0:
                     segs.append(buf)
@@ -106,7 +127,7 @@ def _split_long_text(s: str, max_len: int = TRANSLATE_SEGMENT_MAX_CODEPOINTS):
                     part = ""
                 else:
                     window = part[:limit]
-                    # look for last good breakpoint in window
+                    # ウィンドウ内で最後の良い分割点を探す
                     cut = max(
                         window.rfind("\n"),
                         window.rfind("。"),
@@ -130,7 +151,7 @@ def _split_long_text(s: str, max_len: int = TRANSLATE_SEGMENT_MAX_CODEPOINTS):
     if cur:
         segs.append(cur)
 
-    # Final safety: if any segment still exceeds max_len, hard-split it
+    # 最終的な安全策：どのセグメントも max_len を超える場合は、強制的に分割する
     out = []
     for t in segs:
         if len(t) <= max_len:
@@ -142,6 +163,7 @@ def _split_long_text(s: str, max_len: int = TRANSLATE_SEGMENT_MAX_CODEPOINTS):
                 start += max_len
     return out
 
+ # 文字列リストを合計コードポイント制限内で分割し、バッチ化するイテレータ関数
 def _iter_packs_by_codepoints(strings, *, max_total: int = TRANSLATE_REQ_MAX_CODEPOINTS, headroom: int = TRANSLATE_REQ_HEADROOM):
     """
     Yield lists of strings such that the sum of codepoints in each list does not exceed (max_total - headroom).
@@ -179,23 +201,27 @@ def _iter_packs_by_codepoints(strings, *, max_total: int = TRANSLATE_REQ_MAX_COD
     if batch:
         yield batch
 
-# Translation LLM 用の追加設定
+
+# --- Vertex AI LLM翻訳用の追加設定 ---
 TRANSLATION_ENGINE = os.getenv("TRANSLATION_ENGINE", "LLM")  # LLM or NMT
 DETECT_LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION_DETECT", "global")
 DETECT_SAMPLE_CHARS = int(os.getenv("DETECT_SAMPLE_CHARS", "800"))  # 言語判定は先頭 N 文字で
 
-# ------------------------------------------------------------------------------
-# 1.  記事 JSON を読み込む
-# ------------------------------------------------------------------------------
+
+# === 1. 記事JSONの読み込みと正規化 ===
 ARTICLES_PATH = Path("output/articles.json")
 with ARTICLES_PATH.open(encoding="utf-8") as f:
     articles_raw = json.load(f)
 
-# pandas データフレーム化（扱いやすさ重視）
+
+# --- JSONをpandas DataFrameに変換 ---
 df_articles = pd.json_normalize(articles_raw)
 
-# --- articles.json のフィールド名ゆれを吸収（代表名に正規化） -----------------
-# よくある別名: publishedAt/pubDate/date, link, description/summary/body/text 等
+
+# --- フィールド名の揺れを代表名に正規化（よくある別名に対応） ---
+
+ # DataFrame内のカラム名の揺れを代表名に正規化する関数
+ # よくある別名: publishedAt/pubDate/date, link, description/summary/body/text 等
 
 def _coalesce_col(df, target, candidates):
     # 既に target があればそれを優先（空は後で埋める）
@@ -214,7 +240,8 @@ _coalesce_col(df_articles, "title", ["headline", "name"])                    # �
 _coalesce_col(df_articles, "url", ["link", "permalink"])                     # URL
 _coalesce_col(df_articles, "content", ["description", "summary", "body", "text"])  # 本文
 
-# --- sanitize: published に FETCH ERROR が含まれる場合は published と content を null ---
+
+# --- publishedにFETCH ERRORが含まれる場合のクリーニング ---
 if "published" in df_articles.columns:
     _mask_pub_fetch = df_articles["published"].astype(str).str.contains("FETCH ERROR", case=False, na=False)
     if _mask_pub_fetch.any():
@@ -222,14 +249,16 @@ if "published" in df_articles.columns:
         df_articles.loc[_mask_pub_fetch, ["published", "content"]] = pd.NA
 
 
-# --- sanitize: title に FETCH ERROR がある場合は title と content を null ---
+
+# --- titleにFETCH ERRORが含まれる場合のクリーニング(title と content を null ) ---
 if "title" in df_articles.columns:
     _mask_title_fetch = df_articles["title"].astype(str).str.contains("FETCH ERROR", case=False, na=False)
     if _mask_title_fetch.any():
         _dbg("normalize: title contains FETCH ERROR rows:", int(_mask_title_fetch.sum()))
         df_articles.loc[_mask_title_fetch, ["title", "content"]] = pd.NA
 
-# --- 欠損の統一: None / "" / "None" → <NA> に揃える（翻訳ショートサーキット用） ---
+
+# --- 欠損値を<NA>に統一（翻訳処理のため） ---
 for _col in ["title", "content", "published"]:
     if _col in df_articles.columns:
         s = pd.Series(df_articles[_col], dtype="string")
@@ -237,8 +266,10 @@ for _col in ["title", "content", "published"]:
         s = s.mask(s == "", pd.NA)
         df_articles[_col] = s
 
-# URL がスキーム無しでも動く堅牢なドメイン抽出
 
+# --- URLからドメイン名を抽出する関数 ---
+
+ # URL文字列からドメイン名部分のみを抽出する関数
 def _to_domain(u):
     s = "" if u is None else str(u).strip()
     if not s:
@@ -252,17 +283,18 @@ def _to_domain(u):
 
 df_articles["domain"] = df_articles["url"].map(_to_domain)
 
-# ------------------------------------------------------------------------------
-# 2.  master_media_data-utf8.csv を読み込む
-# ------------------------------------------------------------------------------
-# GCS優先＋ローカルfallbackで媒体CSVを読む
+
+# === 2. 媒体CSVの読み込み（GCS優先＋ローカルfallback） ===
+
+# --- GCSまたはローカルから媒体CSVを読み込む ---
 _LOCAL_MEDIA = Path("data/master_media_data-utf8.csv")
 _GCS_MEDIA   = "gs://urlcloner/data/master_media_data-utf8.csv"
 
+ # GCSまたはローカルから媒体CSVを読み込む関数
 def _read_media_csv():
     # 1) GCS（gcsfs経由で直接読み取り）
     try:
-        # import inside function so the module is optional at import time
+        # このモジュールは必須ではないため、読み込み時の依存を避けるために関数内でインポートする
         import gcsfs  # noqa: F401
         print("[INFO] Loading media list from GCS:", _GCS_MEDIA)
         return pd.read_csv(_GCS_MEDIA, encoding="utf-8")
@@ -289,23 +321,28 @@ def _read_media_csv():
 
 df_media = _read_media_csv()
 
-# ★CSV 側の URL 列名が違う場合はここを書き換えてください
+
+# --- CSVのURL列名が異なる場合はここを修正 ---
 CSV_URL_COL = "URL"
 
-# ドメイン列を作成
+
+# --- 媒体CSVからドメイン列を作成 ---
 df_media["domain"] = df_media[CSV_URL_COL].map(_to_domain)
 
-# media 側はドメイン単位で一意化（重複があると articles が増殖するため）
+
+# --- 媒体側はドメイン単位で一意化 ---
 _media_cols = ["domain", "国", "資料源", "オフィシャル度"]
 media_view = df_media[_media_cols].drop_duplicates("domain")
 _dbg("media domains: total=", df_media["domain"].nunique(), "unique_used=", media_view["domain"].nunique())
 
-# --- 記事ドメイン → media ドメインの最長サフィックス一致（subdomain 対応） ---
+
+# --- 記事ドメインと媒体ドメインの最長サフィックス一致ロジック ---
 _media_domains_sorted = sorted(
     [d for d in media_view["domain"].dropna().astype(str).unique()],
     key=len, reverse=True
 )
 
+ # 記事ドメインに最もよく一致する媒体ドメインを返す関数
 def _best_media_domain(article_domain):
     if article_domain is pd.NA or article_domain is None:
         return pd.NA
@@ -316,11 +353,14 @@ def _best_media_domain(article_domain):
             return md  # 最も長い一致を返す（先に長い順で探索）
     return pd.NA  # 一致なし
 
-# 記事ごとに最適な media ドメインを付与
+
+# --- 記事ごとに最適な媒体ドメインを付与 ---
 df_articles["media_domain"] = df_articles["domain"].map(_best_media_domain)
 _dbg("articles with matched media domain:", int(df_articles["media_domain"].notna().sum()),
      "unmatched:", int(df_articles["media_domain"].isna().sum()))
 
+
+# === 3. 記事と媒体情報のドメインキーによる結合（left join） ===
 # ------------------------------------------------------------------------------
 # 3.  ドメインキーで結合（articles を左、media を右にする left join）
 #     ─ 記事（articles.json）を主として保持し、該当がない場合は CSV 側は欠損のまま
@@ -335,10 +375,8 @@ df_joined = pd.merge(
     suffixes=("_art", "_csv"),
 )
 
-# ------------------------------------------------------------------------------
-# 4.  必要カラムを整形
-#     （CSV 側の列名が異なる場合は同様に修正してください）
-# ------------------------------------------------------------------------------
+
+# === 4. 必要カラムの整形・リネーム・欠損補完 ===（CSV 側の列名が異なる場合は同様に修正してください）
 OUTPUT_COLS = {
     "国":           "国",          # ★CSV: 国名列
     "反応主体":     "資料源",      # ★CSV: 「資料源」列を出力「反応主体」へ
@@ -349,11 +387,13 @@ OUTPUT_COLS = {
     "本文":         "content",     # JSON: content
 }
 
-# 英語 → 日本語 の向きで確実にリネーム
+
+# --- 英語→日本語のカラム名リネーム ---
 _cols_select = list(OUTPUT_COLS.values())
 _rename_map = {v: k for k, v in OUTPUT_COLS.items()}
 
-# まずは存在している列だけを安全に選択（欠けは後段で補完）
+
+# --- 存在する列のみ安全に選択 ---
 _existing = [c for c in _cols_select if c in df_joined.columns]
 _missing  = [c for c in _cols_select if c not in df_joined.columns]
 if _missing:
@@ -361,17 +401,20 @@ if _missing:
 
 df_out = df_joined[_existing].rename(columns=_rename_map)
 
-# URL 重複はここで排除（翻訳の重複コストも抑制）
+
+# --- URL重複排除（翻訳コスト削減） ---
 _before = len(df_out)
 df_out = df_out.drop_duplicates(subset=["URL"], keep="first")
 _dbg("drop_duplicates by URL:", _before, "→", len(df_out))
 
-# 欠けているターゲット列を空で補完
+
+# --- 欠損ターゲット列を空で補完 ---
 for _src, _dst in _rename_map.items():
     if _dst not in df_out.columns:
         df_out[_dst] = ""
 
-# CSV 側（国/反応主体/オフィシャル度）はそのまま残っているか確認 + エイリアス対応
+
+# --- CSV側のカラムが無い場合のエイリアス補完 ---
 _ALIAS_SRC = {
     "国": ["国"],
     "反応主体": ["反応主体", "資料源"],
@@ -389,7 +432,8 @@ for _dst in ["国", "反応主体", "オフィシャル度"]:
     if not filled:
         df_out[_dst] = ""
 
-# --- デバッグ出力: 件数やカラム
+
+# --- デバッグ用: 件数やカラム情報出力 ---
 _dbg("rows: articles=", len(df_articles), "media=", len(df_media), "joined=", len(df_joined))
 _dbg("df_joined columns:", list(df_joined.columns))
 _dbg("df_out columns (pre-translate):", list(df_out.columns))
@@ -401,6 +445,9 @@ TRANSLATE_LOCATION = os.getenv("TRANSLATE_LOCATION") or "us-central1"
 TARGET_LANG = os.getenv("TARGET_LANG", "ja")
 _dbg("locations:", {"vertex": VERTEX_LOCATION, "translate": TRANSLATE_LOCATION, "detect": DETECT_LOCATION})
 
+
+# === 4.5 Vertex AI/Cloud Translationによる自動翻訳処理 ===
+# タイトル・本文を日本語へ翻訳し新カラムとして追加。言語判定やAPIエラー時のフォールバックも実装。
 # ------------------------------------------------------------------------------
 # 4.5  翻訳（Translation LLM on Vertex AI で日本語化）
 #       ・"タイトル" → "タイトル（日本語）"
@@ -417,7 +464,8 @@ if ENABLE_TRANSLATION:
             "Google Cloud のプロジェクト ID が未設定です。環境変数 GOOGLE_CLOUD_PROJECT もしくは GCP_PROJECT_ID を設定してください。"
         )
 
-    # --- 言語判定 (Cloud Translation v3) --------------------------------------
+
+    # --- Cloud Translation v3による言語判定 ---
     if not _GCP_TRANSLATE_AVAILABLE:
         raise ImportError(
             "google-cloud-translate が見つかりません。`pip install google-cloud-translate` を実行してください。"
@@ -425,6 +473,7 @@ if ENABLE_TRANSLATION:
     lang_client = translate.TranslationServiceClient()
     detect_parent = f"projects/{GCP_PROJECT_ID}/locations/{DETECT_LOCATION}"
 
+    # テキストの言語をCloud Translation APIで判定する関数
     def _detect_lang(text: str) -> str:
         text = (text or "")
         if not text:
@@ -439,13 +488,16 @@ if ENABLE_TRANSLATION:
         langs = getattr(resp, "languages", [])
         return (langs[0].language_code if langs else "und")
 
-    # --- Translation LLM 呼び出し (Vertex AI PredictionService) ---------------
+
+    # --- Vertex AI PredictionServiceによるLLM翻訳 ---
     if not _GCP_AIPLATFORM_AVAILABLE:
         raise ImportError(
             "google-cloud-aiplatform が見つかりません。`pip install google-cloud-aiplatform` を実行してください。"
         )
 
+    # Vertex AI PredictionServiceを使ってLLM翻訳を実行する関数
     def _llm_translate_batch(texts, src_lang: str, *, target=TARGET_LANG):
+        # 指定ロケーションでPredictionServiceClientを呼び出す内部関数
         def _predict_with_location(loc: str):
             client = aiplatform.gapic.PredictionServiceClient(
                 client_options={"api_endpoint": f"{loc}-aiplatform.googleapis.com"}
@@ -479,7 +531,9 @@ if ENABLE_TRANSLATION:
                 translations.extend(p.get("translations", []))
         return [t.get("translatedText", "") for t in translations]
 
-    # --- NMT フォールバック（任意） -----------------------------------------
+
+    # --- NMT(従来型)翻訳APIによるフォールバック ---
+    # Cloud Translation(NMT) APIでリストを翻訳し、サイズ超過時は分割再試行する関数
     def _nmt_translate_list(values, *, target=TARGET_LANG):
         """
         Translate a list of strings using Cloud Translation (NMT) while respecting per-request codepoint limits.
@@ -499,7 +553,7 @@ if ENABLE_TRANSLATION:
                 )
                 out.extend([t.translated_text for t in resp.translations])
             except gax_exceptions.InvalidArgument:
-                # Location issues or hidden size overhead: try fallback locations then split further
+            # ロケーションの問題や隠れたサイズ超過が原因の可能性があるため、フォールバック先を試し、さらに分割して再試行する
                 tried_locs = []
                 ok = False
                 for loc in ("us-central1", "global"):
@@ -521,25 +575,28 @@ if ENABLE_TRANSLATION:
                         ok = True
                         break
                     except gax_exceptions.InvalidArgument:
-                        # As an extra guard, split the pack into halves and retry
+                        # 追加の安全策として、パックを半分に分割して再試行する
+
                         pass
                 if not ok:
-                    # final fallback: split this pack into smaller subpacks and retry recursively
+                    # 最終フォールバック：このパックをさらに小さなサブパックに分割し、再帰的に再試行する
                     if len(pack) > 1:
                         mid = len(pack) // 2
                         out.extend(_nmt_translate_list(pack[:mid], target=target))
                         out.extend(_nmt_translate_list(pack[mid:], target=target))
                     else:
-                        # single item still too large → split the string further and retry
+                        # 単一アイテムでもまだ大きすぎる場合 → 文字列をさらに分割して再試行する
                         pieces = _split_long_text(pack[0], TRANSLATE_SEGMENT_MAX_CODEPOINTS // 2)
                         out.extend(_nmt_translate_list(pieces, target=target))
         return out
 
+    # pandas.SeriesをNMTで翻訳し新しいSeriesとして返す関数
     def _nmt_translate_series(series, *, target=TARGET_LANG, batch_size=TRANSLATE_BATCH_SIZE):
         # batch_size is ignored; we pack by codepoints instead.
         values = series.fillna("").astype(str).tolist()
         return pd.Series(_nmt_translate_list(values, target=target), index=series.index)
 
+    # pandas.SeriesをLLMで翻訳し新しいSeriesとして返す関数
     def _translate_series_with_llm(series, *, target=TARGET_LANG, batch_size=TRANSLATE_BATCH_SIZE):
         # 言語判定 → 同言語ごとにまとめて LLM 翻訳（長文・総量の上限に配慮）
         s = series.fillna("").astype(str)
@@ -581,7 +638,8 @@ if ENABLE_TRANSLATION:
 
         return out
 
-    # 列を挿入（元列の直後）
+
+    # --- 翻訳済みカラムを元列の直後に挿入 ---
     if "タイトル" in df_out.columns:
         df_out.insert(
             df_out.columns.get_loc("タイトル") + 1,
@@ -595,33 +653,38 @@ if ENABLE_TRANSLATION:
             _translate_series_with_llm(df_out["本文"], target=TARGET_LANG),
         )
 
-# ------------------------------------------------------------------------------
-# 4.9  出力カラム最終整形（列名・順序・NO./空列 など）
-# ------------------------------------------------------------------------------
-# 指定の列名にリネーム
+
+# === 4.9 出力カラムの最終整形（列名・順序・NO.付与など） ===
+
+# --- 指定列名へのリネーム ---
 df_out = df_out.rename(columns={
     "国": "国（地域）",
     "タイトル": "タイトル（原語）",
 })
 
-# 必須列を空でも作成
+
+# --- 必須列が無い場合は空で作成 ---
 for _col in ["日付", "URL", "本文", "タイトル（原語）"]:
     if _col not in df_out.columns:
         df_out[_col] = ""
 
-# 訳語列が存在しない場合は空で作成（保険）
+
+# --- 訳語列が無い場合の保険 ---
 for _col in ["タイトル（日本語）", "和訳"]:
     if _col not in df_out.columns:
         df_out[_col] = ""
 
 
-# 追加の空列
+
+# --- 追加の空列を作成 ---
 for _col in ["キーワード", "備考欄"]:
     if _col not in df_out.columns:
         df_out[_col] = ""
 
 
-# 日付フォーマット統一（例: 2025-05-28T15:46:08.772000+00:00 → 5月28日）
+
+# --- 日付フォーマットを「月日」表記に統一 ---
+ # 日付を「月日」表記の日本語文字列に変換する関数
 def _fmt_mmdd_jp(v):
     # 欠損や空文字は null（NA）を維持
     if pd.isna(v) or (isinstance(v, str) and v.strip() == ""):
@@ -634,10 +697,12 @@ def _fmt_mmdd_jp(v):
 if "日付" in df_out.columns:
     df_out["日付"] = df_out["日付"].map(_fmt_mmdd_jp)
 
-# NO. 列（先頭に挿入）: 1,2,3... の昇順（半角数字=通常の整数）
+
+# --- NO.列（連番）を先頭に挿入 ---
 df_out.insert(0, "NO.", range(1, len(df_out) + 1))
 
-# 列の最終順序
+
+# --- 列の最終順序を指定 ---
 _desired_cols = [
     "NO.",
     "国（地域）",
@@ -652,27 +717,27 @@ _desired_cols = [
     "キーワード",
     "備考欄",
 ]
-# 念のため存在している列のみで並べ替え
+
+# --- 存在している列のみで並べ替え ---
 _existing_cols = [c for c in _desired_cols if c in df_out.columns]
 df_out = df_out[_existing_cols]
 
-# ------------------------------------------------------------------------------
-# 5.  JSON & CSV ファイルに書き出し（output ディレクトリ配下）
-# ------------------------------------------------------------------------------
+
+# === 5. JSON/CSVファイルへの書き出し処理 ===
 OUTDIR = Path("output")
 OUTDIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_JSON = OUTDIR / "articles_enriched.json"
 OUTPUT_CSV  = OUTDIR / "articles_enriched.csv"
 
-# ── JSON ──────────────────────────────────────────────────────────────
+
+# --- JSONファイル出力 ---
 OUTPUT_JSON.write_text(
     df_out.to_json(orient="records", force_ascii=False, indent=2),
     encoding="utf-8"
 )
 
-# ── CSV ───────────────────────────────────────────────────────────────
-#   ・index=False で行番号を付けない  
-#   ・Excel 互換を考慮して UTF‑8 BOM 付き (utf-8-sig) にするのが無難
+
+# --- CSVファイル出力（Excel互換/BOM付き） ---
 df_out.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
 
 print(

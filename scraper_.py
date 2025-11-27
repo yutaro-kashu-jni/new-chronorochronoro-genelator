@@ -1,3 +1,14 @@
+
+# =============================================================================
+# scraper_.py の役割
+# -----------------------------------------------------------------------------
+# Webページやニュース記事の本文・日付等を多様な手法で抽出する高機能スクレイパーです。
+# ・ドメインごとに抽出ロジックを切り替えるプラグイン方式
+# ・汎用抽出/個別抽出/Playwright等の多段階抽出
+# ・CLI/関数呼び出し両対応、BigQueryやGCS連携も可能
+# ・.envによる環境変数管理や各種外部ライブラリ活用
+# =============================================================================
+
 import re, sys, json, time, requests, bs4, tldextract
 from typing import Callable, Optional, Tuple, List
 import datetime
@@ -13,25 +24,31 @@ from pathlib import Path
 import html
 import atexit
 
+
 """
-Refactored scraper with a plug‑in style extractor registry.
+【本ファイルの役割】
+このファイルは、Webページやニュース記事の本文・公開日付等を多様な手法で高精度に抽出するための高機能スクレイパーです。
+・ドメインごとに抽出ロジックを切り替えるプラグイン方式を採用
+・汎用抽出/個別抽出/Playwright等の多段階抽出カスケード
+・CLI/関数呼び出し両対応、BigQueryやGCS連携も可能
+・.envによる環境変数管理や各種外部ライブラリ活用
 
-Goals:
-  • Keep existing extractor logic intact, but make it easy to add/override per‑domain behavior.
-  • Provide a single registration point via `register_extractor(...)` (or `@domain_extractor(...)`).
-  • Choose the most specific extractor automatically by (priority, path_prefix length).
-  • CLI improvement: allow either a URL file OR direct URLs as arguments.
+【設計方針・目的】
+・既存の抽出ロジックを保ちつつ、ドメインごとの挙動追加・上書きを容易にする
+・`register_extractor(...)`（または `@domain_extractor(...)`）で一元登録
+・priorityやpath_prefix長で最適な抽出器を自動選択
+・CLIでURLファイル/直接URL両対応
 
-How to add a new domain extractor in the future:
-  1) Implement a function `def extract_example(html: str) -> tuple[str|None, datetime|None]: ...`.
-  2) Register it below with either:
-        register_extractor(name="example", domain="example.com", func=extract_example)
-     or for a path‑specific handler:
-        register_extractor(name="example:video", domain="example.com", path_prefix="/video/", func=extract_example, priority=80)
-  3) No other code changes needed.
+【新しいドメイン抽出器の追加方法】
+1) 例: `def extract_example(html: str) -> tuple[str|None, datetime|None]: ...` を実装
+2) 下記のいずれかで登録
+    register_extractor(name="example", domain="example.com", func=extract_example)
+    # またはパス指定:
+    register_extractor(name="example:video", domain="example.com", path_prefix="/video/", func=extract_example, priority=80)
+3) 他のコード修正は不要
 """
 
-# ── Load .env for local development (optional) ───────────────────────────────
+# ── ローカル開発用: .envファイルから環境変数を読み込む（任意） ───────────────
 import os
 from pathlib import Path
 
@@ -54,12 +71,13 @@ except Exception:
                     if not sep:
                         continue
                     _k, _v = _s.split(sep, 1)
-                    os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
+                    os.environ.setdefault(
+                        _k.strip(), _v.strip().strip('"').strip("'"))
         except Exception:
             pass
 
 # ================================
-# Browser/HTTP and global settings
+# ブラウザ/HTTPやグローバル設定
 # ================================
 HEADERS = {
     "User-Agent": (
@@ -77,22 +95,32 @@ TIMEOUT_SEC = 15
 MIN_LENGTH  = 100
 
 
-# ---- RSS disabled: stub for compatibility ----
+
+# ---- RSS機能は無効化（互換用スタブ） ----
 def _try_rss_for_url(url: str) -> dict | None:
-    """RSS step removed; always return None."""
+    """
+    RSS抽出ステップは現在無効化されています。常にNoneを返します。
+    （将来的な拡張や互換性維持のためのスタブ関数です）
+    """
     return None
 
 
-# ---- Step logging + run metadata -------------------------------------------
+# ---- ステップごとのログ記録と実行メタデータ管理 --------------------------------
 
 RUN_ID = os.environ.get("RUN_ID") or time.strftime("%Y%m%d-%H%M%S")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "output")
 STEP_LOG: list[dict] = []
 _LAST_FETCH_WAS_BROWSER = False  # Playwright経由かどうかの判定に利用
 
+
+# ---- スクレイピング処理の各ステップのログを記録する関数 ----
 def _log_step(url: str, step: str, status: str, reason: str | None = None,
               content_len: int | None = None, published: str | None = None,
               extra: dict | None = None) -> None:
+    """
+    各処理ステップの実行状況やメタデータをSTEP_LOGリストに記録します。
+    BigQueryやCSV出力等のための構造化ログとして利用。
+    """
     try:
         rec = {
             "run_id": RUN_ID,
@@ -143,7 +171,10 @@ def _ensure_bq_table(client, dataset: str, table: str) -> None:
         print("[BQ] ensure table skipped:", e)
 
 
-# ---- Playwright browser pool (optional) ------------------------------------
+
+# ---- Playwrightブラウザプール（任意機能） ------------------------------------
+# 複数回のブラウザレンダリングを効率的に行うためのプール機能。
+# BROWSER_POOL=Trueの場合、一定回数ごとにブラウザを再起動し、安定性を確保します。
 _BROWSER = None
 _PLAYWRIGHT = None
 _BROWSER_USES = 0
@@ -152,6 +183,10 @@ BROWSER_ROTATE_EVERY = int(os.environ.get("BROWSER_ROTATE_EVERY", "80"))
 SAVE_RENDERED_HTML_ALL = os.environ.get("SAVE_RENDERED_HTML_ALL", "0") == "1"
 
 def _ensure_browser():
+    """
+    Playwrightのブラウザインスタンスを初期化・再利用します。
+    プール有効時は一定回数ごとに再起動。
+    """
     global _PLAYWRIGHT, _BROWSER, _BROWSER_USES
     if not BROWSER_POOL:
         return None
@@ -244,29 +279,42 @@ def _flush_step_logs():
 #atexit.register(_flush_step_logs)
 
 # =====================
-# Extractor registration
+# 抽出器（extractor）登録処理
 # =====================
 @dataclass
 class Extractor:
     name: str
-    domain: str                 # e.g. "dvidshub.net" (no www)
+    domain: str                 # 例: "dvidshub.net"（wwwなし）
     func: Callable[[str], Tuple[Optional[str], Optional[datetime.datetime]]]
-    path_prefix: Optional[str] = None   # e.g. "/image/"
+    path_prefix: Optional[str] = None   # 例: "/image/"
     path_regex: Optional[re.Pattern] = None
-    no_fallback: bool = False           # if True, skip generic fallback extractor
-    priority: int = 50                  # higher first (use 80+ for path‑specific)
+    no_fallback: bool = False           # Trueなら汎用フォールバック抽出器をスキップ
+    priority: int = 50                  # 数字が大きいほど優先（パス指定は80以上推奨）
 
 REGISTRY: List[Extractor] = []
 
 def register_extractor(*, name: str, domain: str, func: Callable[[str], Tuple[Optional[str], Optional[datetime.datetime]]],
                        path_prefix: Optional[str] = None, path_regex: Optional[re.Pattern] = None,
                        no_fallback: bool = False, priority: int = 50) -> None:
+    """
+    新しい抽出器（extractor）をレジストリに登録します。
+    name: 識別名
+    domain: 対象ドメイン
+    func: 本文・日付抽出関数
+    path_prefix, path_regex: パス条件
+    no_fallback: Trueなら汎用フォールバックを使わない
+    priority: 優先度
+    """
     REGISTRY.append(Extractor(name=name, domain=domain, func=func,
                               path_prefix=path_prefix, path_regex=path_regex,
                               no_fallback=no_fallback, priority=priority))
 
 def find_extractor(domain: str, path: str) -> Optional[Extractor]:
     candidates: List[Extractor] = []
+    """
+    ドメイン・パス条件に合致する最適な抽出器を選択して返します。
+    優先度(priority)・パス長でソート。
+    """
     for ext in REGISTRY:
         if ext.domain != domain:
             continue
@@ -277,14 +325,19 @@ def find_extractor(domain: str, path: str) -> Optional[Extractor]:
             ok = False
         if ok:
             candidates.append(ext)
-    # Sort by priority desc, then by length of path_prefix desc (more specific first)
+    # priority降順→path_prefix長降順でソート（より具体的なものを優先）
     candidates.sort(key=lambda e: (e.priority, len(e.path_prefix or "")), reverse=True)
     return candidates[0] if candidates else None
 
 
-# DVIDS image extractor
+
+# DVIDS画像ページ専用のキャプション・日付抽出器
 def extract_dvids_image(html_str: str) -> Tuple[Optional[str], Optional[datetime.datetime]]:
-    """Return the photo caption and its date for DVIDS /image/ pages."""
+    """
+    DVIDSの/image/ページから写真キャプションと日付を抽出します。
+    ・metaタグやDOM内のキャプション要素を優先的に取得
+    ・日付は"Date Posted:"や"Date Taken:"から抽出
+    """
     soup = bs4.BeautifulSoup(html_str, "lxml")
     og = soup.find("meta", property="og:description")
     caption = og["content"].strip() if og and og.get("content") else None
@@ -301,8 +354,14 @@ def extract_dvids_image(html_str: str) -> Tuple[Optional[str], Optional[datetime
     pub_dt = _parse_date(raw) or _find_pub_date(html_str, soup)
     return caption, pub_dt
 
-# DVIDS video extractor
+
+# DVIDS動画ページ専用のキャプション・日付抽出器
 def extract_dvids_video(html: str) -> Tuple[Optional[str], Optional[datetime.datetime]]:
+    """
+    DVIDSの/video/ページから動画キャプションと日付を抽出します。
+    ・全体テキストからキャプションらしき部分を正規表現で抽出
+    ・日付は"Date Posted:"から抽出
+    """
     soup = bs4.BeautifulSoup(html, "lxml")
 
     # 1. 全体テキストを取得
@@ -315,7 +374,7 @@ def extract_dvids_video(html: str) -> Tuple[Optional[str], Optional[datetime.dat
     )
     desc = match.group(0) if match else None
 
-    # 3. 日付取得（従来通り）
+    # 3. 日付取得
     raw = None
     for txt in soup.stripped_strings:
         if txt.startswith("Date Posted:"):
@@ -326,12 +385,18 @@ def extract_dvids_video(html: str) -> Tuple[Optional[str], Optional[datetime.dat
     pub_dt = _parse_date(raw) or _find_pub_date(html, soup)
     return desc, pub_dt
 
- # defense.gov Multimedia Photos (/Multimedia/Photos/igphoto/...) extractor
- # Site-specific and side-effect free (only used for the igphoto path)
+
+# defense.govの写真ページ（/Multimedia/Photos/igphoto/...）専用抽出器
+# サイト固有の構造に対応し、副作用なし（igphotoパス専用）
 def extract_defense_igphoto(html: str) -> Tuple[Optional[str], Optional[datetime.datetime]]:
+    """
+    defense.govの写真ページからキャプションと日付を抽出します。
+    ・metaタグ（og:description, twitter:description）を優先
+    ・figcaptionやcaptionクラス内の<p>要素も探索
+    """
     soup = bs4.BeautifulSoup(html, "lxml")
 
-    # Prefer meta descriptions first (usually the clean caption)
+    # まずmeta descriptionを優先（通常はクリーンなキャプション）
     text = None
     og = soup.find("meta", attrs={"property": "og:description"})
     if og and og.get("content"):
@@ -341,9 +406,9 @@ def extract_defense_igphoto(html: str) -> Tuple[Optional[str], Optional[datetime
         if tw and tw.get("content"):
             text = tw["content"].strip()
 
-    # DOM caption fallbacks (prefer <p> inside figcaption/caption blocks)
+    # DOM内のキャプション要素（figcaptionやcaptionクラス内の<p>）も探索
     if not text:
-        # 1) direct <p> inside caption containers
+        # 1) captionコンテナ内の<p>を優先
         psel = soup.select(
             "figure figcaption p, .image__caption p, .image-caption p, .photo__caption p, .photo-caption p, .figure__caption p, .caption p"
         )
@@ -411,6 +476,7 @@ def extract_dvids_news(html: str) -> Tuple[Optional[str], Optional[datetime.date
     ])
 
     def _clean_to_body(raw_text: str, title_text: str) -> Optional[str]:
+        # 本文テキストの後処理を行う（著者名・コピーライト・シグナル語・空行の正規化など）
         # 1) NEWS INFO より後ろは切り捨て
         t = re.split(r"\bNEWS\s*INFO\b", raw_text, maxsplit=1, flags=re.I)[0].strip()
         # 2) タイトルが先頭に残っていれば除去
@@ -531,6 +597,8 @@ def extract_dvids_audio(html: str) -> Tuple[Optional[str], Optional[datetime.dat
     ])
 
     text = None
+    # フォールバック抽出カスケード（Trafilatura→Readability→Newspaper3k→LLM）
+    # 各手法で本文・日付抽出を順に試行し、どれか成功した時点で(content, pub_dt)を返す
 
     # Strategy A: Gather text AFTER the /audio/embed/ iframe (including NavigableString nodes)
     iframe = soup.find("iframe", src=re.compile(r"/audio/embed/"))
@@ -650,18 +718,22 @@ def extract_dvids_audio(html: str) -> Tuple[Optional[str], Optional[datetime.dat
 
 
 def _crntt_find_title(soup: bs4.BeautifulSoup) -> Optional[str]:
-    # Prefer meta title if present
+    """
+    CRNTT記事タイトル抽出用ヘルパー関数。
+    metaタグ→h1/h2→UIノイズ除去後の最初の有効行の順で判定。
+    """
+    # metaタグ（og:title, name=title）を優先
     og = soup.find("meta", attrs={"property": "og:title"}) or soup.find("meta", attrs={"name": "title"})
     if og and og.get("content"):
         return og["content"].strip()
-    h = soup.find(["h1", "h2"])  # sometimes there is a heading
+    # h1/h2見出しを次に優先
+    h = soup.find(["h1", "h2"])
     if h:
         t = h.get_text(" ", strip=True)
         if t:
             return t
-    # Fallback: first meaningful visible line before the date row
+    # UIノイズや日付行を除去した最初の有効行を返す
     lines = [ln.strip() for ln in soup.get_text("\n", strip=True).splitlines() if ln.strip()]
-    # Drop UI tokens
     while lines and (re.search(r"〖[^〗]+〗", lines[0]) or "打印" in lines[0] or re.search(r"\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}", lines[0]) or "CRNTT" in lines[0].upper()):
         lines.pop(0)
     return lines[0] if lines else None
@@ -670,7 +742,10 @@ def _crntt_find_title(soup: bs4.BeautifulSoup) -> Optional[str]:
 
 # Helper for vietnam.vn title extraction
 def _vietnam_vn_find_title(soup: bs4.BeautifulSoup) -> Optional[str]:
-    """Prefer og:title, then visible <h1>, then <title>."""
+    """
+    vietnam.vn記事タイトル抽出用ヘルパー関数。
+    og:title→h1→titleの順で判定。
+    """
     og = soup.find("meta", attrs={"property": "og:title"})
     if og and og.get("content"):
         return og["content"].strip()
@@ -685,6 +760,10 @@ def _vietnam_vn_find_title(soup: bs4.BeautifulSoup) -> Optional[str]:
 
 # Helper for rfi.fr title extraction (language-agnostic)
 def _rfi_find_title(soup: bs4.BeautifulSoup) -> Optional[str]:
+    """
+    rfi.fr記事タイトル抽出用ヘルパー関数。
+    og:title→h1→twitter:title→titleの順で判定。
+    """
     og = soup.find("meta", attrs={"property": "og:title"})
     if og and og.get("content"):
         return og["content"].strip()
@@ -702,8 +781,10 @@ def _rfi_find_title(soup: bs4.BeautifulSoup) -> Optional[str]:
 
 # Helper for ct.moreover.com title extraction (structure-based, language-agnostic)
 def _moreover_find_title(soup: bs4.BeautifulSoup) -> Optional[str]:
-    """Prefer OpenGraph/Twitter/meta title, then visible <h1>, then <title>.
-    This is DOM-structure based and language-agnostic.
+    """
+    ct.moreover.com記事タイトル抽出用ヘルパー関数。
+    og:title→twitter:title→meta title→h1→titleの順で判定。
+    DOM構造ベースで言語非依存。
     """
     og = soup.find("meta", attrs={"property": "og:title"})
     if og and og.get("content"):
@@ -725,7 +806,10 @@ def _moreover_find_title(soup: bs4.BeautifulSoup) -> Optional[str]:
 
 # Helper for idahostatesman.com title extraction (structure-based, language-agnostic)
 def _idahostatesman_find_title(soup: bs4.BeautifulSoup) -> Optional[str]:
-    """Prefer OpenGraph/Twitter/meta title, then visible <h1>, then <title>."""
+    """
+    idahostatesman.com記事タイトル抽出用ヘルパー関数。
+    og:title→twitter:title→meta title→h1→titleの順で判定。
+    """
     og = soup.find("meta", attrs={"property": "og:title"})
     if og and og.get("content"):
         return og["content"].strip()
@@ -749,9 +833,9 @@ _SEP_RE = re.compile(r"\s*(?:\||–|—|•|·|-)\s*")
 
 def _site_name_tokens(domain: str, soup: bs4.BeautifulSoup) -> set[str]:
     """
-    Build a set of strings that represent the site's brand to help strip it
-    from <title> suffixes like `" - SiteName | Example.com"`.
-    Includes variations of domain, base label, and og:site_name.
+    サイト名やブランド名を表す文字列セットを生成し、
+    <title>の末尾からブランド名やセクション名を除去するために利用します。
+    ドメイン、ベースラベル、og:site_name等のバリエーションを含みます。
     """
     tokens: set[str] = set()
     host = domain.replace("www.", "")
@@ -791,9 +875,8 @@ def _site_name_tokens(domain: str, soup: bs4.BeautifulSoup) -> set[str]:
 
 def _strip_site_brand_from_title(title: str, site_tokens: set[str]) -> str:
     """
-    Remove trailing brand/section chunks from a title using common separators.
-    Example:
-      "Headline goes here - memesita.com - Memesita" -> "Headline goes here"
+    タイトル末尾のブランド名やセクション名を共通区切り記号で除去します。
+    例: "Headline goes here - memesita.com - Memesita" → "Headline goes here"
     """
     if not title:
         return title
@@ -818,16 +901,17 @@ def _strip_site_brand_from_title(title: str, site_tokens: set[str]) -> str:
         parts.pop()
 
     cleaned = " - ".join(parts).strip()
-    cleaned = re.sub(r"\s*(?:\||–|—|•|·|-)\s*$", "", cleaned)
+    cleaned = re.sub(r"\s*(?:\||–|—|•|·|-)", "", cleaned)
     cleaned = re.sub(r"\s{2,}", " ", cleaned)
     return cleaned
 
 def _find_title_generic(soup: bs4.BeautifulSoup, domain: str) -> Optional[str]:
     """
-    Structure‑first, language‑agnostic title selector:
-      1) visible <h1> (prefer inside article/main)
-      2) og:title / twitter:title / meta[name=title]
-      3) <title> (with brand suffix stripped)
+    汎用的なタイトル抽出関数（構造優先・言語非依存）。
+    1) article/main内のh1等の見出し
+    2) og:title / twitter:title / meta[name=title]
+    3) <title>（ブランド除去後）
+    の順で判定します。
     """
     def _text(el):
         return el.get_text(" ", strip=True) if el else None
@@ -857,8 +941,10 @@ def _find_title_generic(soup: bs4.BeautifulSoup, domain: str) -> Optional[str]:
 
 # Helper for shobserver.com title extraction (structure-based, language-agnostic)
 def _shobserver_find_title(soup: bs4.BeautifulSoup) -> Optional[str]:
-    """Prefer OG/Twitter/meta title, then visible <h1>/headline blocks inside the article container.
-    Avoid relying on any language tokens; use only DOM structure.
+    """
+    shobserver.com記事タイトル抽出用ヘルパー関数。
+    OG/Twitter/meta title→article内h1/見出し→titleの順で判定。
+    言語トークンに依存せずDOM構造のみで判定。
     """
     for css, attr in (
         ("meta[property='og:title']", "content"),
@@ -896,10 +982,11 @@ def _shobserver_find_title(soup: bs4.BeautifulSoup) -> Optional[str]:
 
 # rfi.fr article extractor (HTML-structure based, language-agnostic)
 def extract_rfi(html: str) -> Tuple[Optional[str], Optional[datetime.datetime]]:
-    """Extractor for rfi.fr articles.
-    - Finds <article> (or main role container) and strips share/tags/related/comments blocks via CSS selectors
-    - Gets body from [itemprop='articleBody'] or common article body classes
-    - Published date comes from meta/JSON-LD/<time datetime> via existing helpers
+    """
+    rfi.fr記事抽出用エクストラクタ。
+    ・<article>やmainコンテナを特定し、シェア/タグ/関連記事/コメント等をCSSで除去
+    ・[itemprop='articleBody']や代表的な本文クラスから本文を抽出
+    ・公開日はmeta/JSON-LD/<time datetime>等から抽出
     """
     soup = bs4.BeautifulSoup(html, "lxml")
 
@@ -961,11 +1048,11 @@ def extract_rfi(html: str) -> Tuple[Optional[str], Optional[datetime.datetime]]:
  # France24 extractor (video/article pages, language-agnostic)
 def extract_france24(html: str) -> Tuple[Optional[str], Optional[datetime.datetime]]:
     """
-    Extractor for france24.com (video/article pages, language-agnostic).
-    - Title: og:title → JSON-LD headline/name → <h1> → <title>
-    - Content: og:description → meta[name=description] → JSON-LD description → visible description block
-    - Published: <time datetime> → JSON-LD uploadDate/datePublished/dateCreated/dateModified → generic helpers
-    Returns (content, pub_dt).
+    france24.com（動画/記事ページ）用エクストラクタ（言語非依存）。
+    ・タイトル: og:title→JSON-LD headline/name→h1→title
+    ・本文: og:description→meta[name=description]→JSON-LD description→可視descriptionブロック
+    ・公開日: <time datetime>→JSON-LD uploadDate/datePublished/dateCreated/dateModified→汎用ヘルパー
+    (content, pub_dt)を返します。
     """
     import html as _html  # avoid shadowing the html string param above
     soup = bs4.BeautifulSoup(html, "lxml")
@@ -2994,30 +3081,30 @@ def scrape_one(url: str) -> dict:
         "published": pub_dt.isoformat() if isinstance(pub_dt, datetime.datetime) else None,
         "content": content,
     }
-
+# 以下、初めからコメントアウトしていた箇所
 # def main(urls: list[str]) -> None:
-    results = []
-    total = len(urls)
-    for idx, u in enumerate(urls, 1):
-        try:
-            results.append(scrape_one(u))
-        except Exception as e:
-            results.append({"url": u, "title": "SCRAPE ERROR", "published": None, "content": f"Scraping failed: {e}"})
-        # ログ出力: 件数形式の日本語
-        import logging
-        logger = logging.getLogger("scraper")
-        logger.info("%d件目／合計 %d 件が完了しました。", idx, total)
-        print(f"{idx}件目／合計 {total} 件が完了しました。")
-    for art in results:
-        print(f"=== {art['title']} ===")
-        print(f"URL: {art['url']}")
-        print(f"Published: {art['published']}\n")
-        print(art["content"][:1000], "...\n---\n")
-    outdir = Path("output")
-    outdir.mkdir(parents=True, exist_ok=True)
-    outpath = outdir / "articles.json"
-    with outpath.open("w", encoding="utf-8") as fp:
-        json.dump(results, fp, ensure_ascii=False, indent=2)
+#     results = []
+#     total = len(urls)
+#     for idx, u in enumerate(urls, 1):
+#         try:
+#             results.append(scrape_one(u))
+#         except Exception as e:
+#             results.append({"url": u, "title": "SCRAPE ERROR", "published": None, "content": f"Scraping failed: {e}"})
+#         # ログ出力: 件数形式の日本語
+#         import logging
+#         logger = logging.getLogger("scraper")
+#         logger.info("%d件目／合計 %d 件が完了しました。", idx, total)
+#         print(f"{idx}件目／合計 {total} 件が完了しました。")
+#     for art in results:
+#         print(f"=== {art['title']} ===")
+#         print(f"URL: {art['url']}")
+#         print(f"Published: {art['published']}\n")
+#         print(art["content"][:1000], "...\n---\n")
+#     outdir = Path("output")
+#     outdir.mkdir(parents=True, exist_ok=True)
+#     outpath = outdir / "articles.json"
+#     with outpath.open("w", encoding="utf-8") as fp:
+#         json.dump(results, fp, ensure_ascii=False, indent=2)
 
 # ======================
 # Registry bindings here

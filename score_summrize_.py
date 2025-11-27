@@ -1,4 +1,16 @@
+
 #!/usr/bin/env python3
+# =============================================================================
+# score_summrize_.py の役割
+# -----------------------------------------------------------------------------
+# 入力CSVの「和訳」カラム（または指定カラム）をVertex AI Gemini LLMに渡し、
+# 「日本関連の評価」JSONを取得して新たなカラムとして追記する自動評価スクリプトです。
+# - 日本への言及有無・スコア・強度・根拠引用などを自動判定し、CSV/Excelに出力します。
+# - GCPプロジェクト/リージョン/モデル/カラム名等は環境変数で柔軟に指定可能です。
+# - LLM API障害時はリージョンを順次フォールバックし、全失敗時も仕様に沿った空評価を返します。
+# - Excel出力時は根拠引用等を改行区切りで見やすく整形します。
+# =============================================================================
+# -*- coding: utf-8 -*-
 # -*- coding: utf-8 -*-
 """
 
@@ -12,7 +24,7 @@ gcloud auth login
 gcloud auth application-default login
 
 # 4) プロジェクトを明示
-gcloud config set project dev-peak
+gcloud config set project dev-peak2
 py
 CSVに「日本関連の評価」カラムを追加するスクリプト。
 - 入力CSVの「和訳」カラム（変更可）をLLMに渡し、評価JSONを受け取り、カラムとして追記します。
@@ -22,7 +34,7 @@ CSVに「日本関連の評価」カラムを追加するスクリプト。
     python score_summrize.py input.csv
 
 環境変数 (必要に応じて上書き可):
-    GOOGLE_CLOUD_PROJECT=dev-peak
+    GOOGLE_CLOUD_PROJECT=dev-peak2
     VERTEX_LOCATION=asia-northeast1
     VERTEX_LLM_MODEL=gemini-2.5-flash
     GENAI_LOCATIONS=asia-northeast1,us-central1,us-east4
@@ -130,11 +142,13 @@ SCHEMA = genai_types.Schema(
 )
 
 
+ # 環境変数を取得し、未設定時はデフォルト値を返す関数
 def getenv(key: str, default: str) -> str:
     v = os.environ.get(key, default)
     return v
 
 
+ # カンマ区切りのリージョン文字列をリスト化し、重複を除去して順序を維持する関数
 def parse_locations(env_val: str) -> List[str]:
     parts = [p.strip() for p in env_val.split(",") if p.strip()]
     # 重複排除を保ちつつ順序維持
@@ -147,6 +161,7 @@ def parse_locations(env_val: str) -> List[str]:
     return ordered or ["asia-northeast1", "us-central1", "us-east4"]
 
 
+ # スコア値を-5.0～5.0の範囲で0.5刻みに丸める関数
 def round_to_half(x: float) -> float:
     try:
         x = float(x)
@@ -160,6 +175,7 @@ def round_to_half(x: float) -> float:
     return sgn * val
 
 
+ # 強度値を1～5の整数に正規化する関数
 def coerce_intensity(val: Any) -> int:
     try:
         v = int(round(float(val)))
@@ -168,6 +184,7 @@ def coerce_intensity(val: Any) -> int:
     return max(1, min(5, v))
 
 
+ # モデル出力(JSON)を仕様に沿って正規化・補完し、後方互換も確保する関数
 def ensure_schema(payload: Dict[str, Any]) -> Dict[str, Any]:
     """モデル出力(JSON)を仕様にアジャスト（後方互換を確保）"""
     mj = bool(payload.get("mentions_japan", False))
@@ -226,10 +243,13 @@ def ensure_schema(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+ # 指定テキストをLLM用プロンプト形式に整形して返す関数
 def build_prompt(text: str) -> str:
     return f"{PROMPT_HEADER}\n{PROMPT_INPUT_PREFIX}{text}"
 
 
+ # 指定テキストをLLMに投げ、リージョン障害時は順次フォールバックして最初の成功結果を返す関数
+ # すべて失敗した場合は仕様に沿った空評価を返す
 def call_gemini_with_fallbacks(
     text: str,
     model_name: str,
@@ -271,8 +291,10 @@ def call_gemini_with_fallbacks(
     }
 
 
+ # 入力CSVを読み込み、各行の指定カラムをLLMで評価し、評価結果カラムを追記して新CSV/Excelを出力する主処理関数
+ # - 評価カラムの追加、重み付きスコア計算、根拠引用の整形、Excel出力も担当
 def process_csv(input_path: str) -> str:
-    project = getenv("GOOGLE_CLOUD_PROJECT", "dev-peak")
+    project = getenv("GOOGLE_CLOUD_PROJECT", "dev-peak2")
     default_loc = getenv("VERTEX_LOCATION", "asia-northeast1")
     locations = parse_locations(getenv("GENAI_LOCATIONS", f"{default_loc},us-central1,us-east4"))
     model_name = getenv("VERTEX_LLM_MODEL", "gemini-2.5-flash")
@@ -453,6 +475,7 @@ def process_csv(input_path: str) -> str:
     return out_path
 
 
+ # コマンドライン引数でCSVパスを受け取り、処理を実行するエントリポイント関数
 def main():
     if len(sys.argv) < 2:
         print("使い方: python main.py input.csv", file=sys.stderr)
