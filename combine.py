@@ -82,8 +82,6 @@ TRANSLATE_SEGMENT_MAX_CODEPOINTS = int(os.getenv("TRANSLATE_SEGMENT_MAX_CODEPOIN
 
 
 # --- デバッグ出力用スイッチと関数 ---
- # デバッグ用: DEBUGが有効な場合のみ標準出力に内容を表示する関数
-def _dbg(*args):
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
 # デバッグ用: DEBUGが有効な場合のみ標準出力に内容を表示する関数
